@@ -19,10 +19,17 @@ const QWEN_CLI_VERSION = "0.13.1";
 const PLUGIN_USER_AGENT = `QwenCode/${QWEN_CLI_VERSION} (${process.platform}; ${process.arch})`;
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const CHAT_MAX_TOKENS_CAP = 65536;
+const GLOBAL_MIN_INTERVAL_MS = envInt("OPENCODE_QWEN_GLOBAL_MIN_INTERVAL_MS", 700, 0, 60_000);
+const GLOBAL_JITTER_MS = envInt("OPENCODE_QWEN_GLOBAL_JITTER_MS", 200, 0, 5_000);
+const TRANSIENT_RETRY_MAX = envInt("OPENCODE_QWEN_TRANSIENT_RETRY_MAX", 1, 0, 3);
+const TRANSIENT_BACKOFF_MS = envInt("OPENCODE_QWEN_TRANSIENT_BACKOFF_MS", 1500, 250, 30_000);
+const TRANSIENT_BACKOFF_MAX_MS = envInt("OPENCODE_QWEN_TRANSIENT_BACKOFF_MAX_MS", 10_000, 500, 60_000);
 /** In-memory token cache to reduce Disk I/O per request (Issue 3.0) */
 const TOKEN_CACHE_TTL_MS = 10_000; // 10 seconds
 let cachedAccountResponse = null;
 let cachedAccountResponseExpiry = 0;
+let nextUpstreamRequestAt = 0;
+let requestSlotChain = Promise.resolve();
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -39,6 +46,62 @@ function getBaseUrl(resourceUrl) {
         // ignore — use default
     }
     return getApiBaseUrl();
+}
+function envInt(name, fallback, min, max) {
+    const raw = process.env[name];
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return fallback;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+        return fallback;
+    }
+    const n = Math.floor(parsed);
+    if (n < min)
+        return min;
+    if (n > max)
+        return max;
+    return n;
+}
+function isTransientStatus(status) {
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+function parseRetryAfterMs(headers) {
+    const value = headers.get("retry-after");
+    if (!value)
+        return null;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) {
+        return Math.max(0, Math.floor(seconds * 1000));
+    }
+    const ts = Date.parse(value);
+    if (!Number.isFinite(ts))
+        return null;
+    return Math.max(0, ts - Date.now());
+}
+async function delay(ms) {
+    if (ms <= 0)
+        return;
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function waitForRequestSlot(extraDelayMs = 0) {
+    let release;
+    const prev = requestSlotChain;
+    requestSlotChain = new Promise((resolve) => {
+        release = resolve;
+    });
+    await prev;
+    try {
+        const now = Date.now();
+        const earliest = Math.max(now, nextUpstreamRequestAt) + Math.max(0, extraDelayMs);
+        await delay(Math.max(0, earliest - now));
+        const jitter = GLOBAL_JITTER_MS > 0 ? Math.floor(Math.random() * (GLOBAL_JITTER_MS + 1)) : 0;
+        nextUpstreamRequestAt = Date.now() + GLOBAL_MIN_INTERVAL_MS + jitter;
+    }
+    finally {
+        if (release)
+            release();
+    }
 }
 /**
  * Resolve a valid access token from multi-account store, disk, or SDK state.
@@ -247,7 +310,10 @@ export const QwenAuthPlugin = async () => ({
                         headers.set("Authorization", `Bearer ${fresh.accessToken}`);
                     }
                     opts.headers = headers;
+                    let transientBackoffMs = TRANSIENT_BACKOFF_MS;
+                    let transientAttempts = 0;
                     // -- Request --
+                    await waitForRequestSlot();
                     let response = await globalThis.fetch(input, opts);
                     // -- 401: token expired mid-session --
                     if (response.status === 401) {
@@ -273,6 +339,7 @@ export const QwenAuthPlugin = async () => ({
                                 cachedAccountResponseExpiry = Date.now() + TOKEN_CACHE_TTL_MS;
                                 headers.set("Authorization", `Bearer ${refreshed.accessToken}`);
                                 opts.headers = headers;
+                                await waitForRequestSlot();
                                 response = await globalThis.fetch(input, opts);
                             }
                             else {
@@ -297,6 +364,7 @@ export const QwenAuthPlugin = async () => ({
                     // Fix 1.2: Use currentAccountId (dynamic) instead of capturedAccountId (static)
                     if (response.status === 429 && currentAccountId) {
                         const body = await response.text().catch(() => "");
+                        const retryAfterMs = parseRetryAfterMs(response.headers);
                         if (body.includes("insufficient_quota")) {
                             try {
                                 await markOAuthAccountQuotaExhausted(currentAccountId, "insufficient_quota");
@@ -316,6 +384,7 @@ export const QwenAuthPlugin = async () => ({
                                         logInfo("Switched account after quota", {
                                             to: next.accountId,
                                         });
+                                    await waitForRequestSlot(retryAfterMs || 0);
                                     response = await globalThis.fetch(input, opts);
                                 }
                                 else {
@@ -343,6 +412,24 @@ export const QwenAuthPlugin = async () => ({
                                 headers: response.headers,
                             });
                         }
+                    }
+                    while (isTransientStatus(response.status) &&
+                        transientAttempts < TRANSIENT_RETRY_MAX) {
+                        transientAttempts += 1;
+                        const retryAfterMs = parseRetryAfterMs(response.headers);
+                        const status = response.status;
+                        if (LOGGING_ENABLED) {
+                            logWarn("Transient upstream status; retrying", {
+                                status,
+                                attempt: transientAttempts,
+                                max: TRANSIENT_RETRY_MAX,
+                            });
+                        }
+                        await response.text().catch(() => "");
+                        const waitMs = retryAfterMs ?? transientBackoffMs;
+                        await waitForRequestSlot(waitMs);
+                        response = await globalThis.fetch(input, opts);
+                        transientBackoffMs = Math.min(transientBackoffMs * 2, TRANSIENT_BACKOFF_MAX_MS);
                     }
                     return response;
                 },
